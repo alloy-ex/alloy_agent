@@ -258,6 +258,11 @@ defmodule AlloyAgent.Server do
     end
   end
 
+  # Dialyzer flags state.config.on_shutdown.(session) at the call below because
+  # Alloy.Agent.Config types on_shutdown as (Alloy.Session.t() -> any()), but
+  # here we pass an %AlloyAgent.Session{}. Runtime contract is "any session-
+  # shaped struct"; the type fix in alloy is tracked at alloy-ex/alloy#40.
+  @dialyzer {:nowarn_function, terminate: 2}
   @impl GenServer
   def terminate(_reason, state) do
     # Kill any running async Turn task — prevents orphaned tasks after shutdown.

@@ -34,10 +34,7 @@ defmodule AlloyAgent.MixProject do
 
   defp deps do
     [
-      # During development, use the sibling alloy path. Before publishing
-      # 0.1.0, bump the `alloy` dep to `{:alloy, "~> 0.13"}` (or whichever
-      # version first drops the extracted runtime modules).
-      {:alloy, path: "../alloy"},
+      {:alloy, "~> 0.12.2"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
