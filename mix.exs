@@ -85,7 +85,6 @@ defmodule AlloyAgent.MixProject do
   defp package do
     [
       files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
-      maintainers: ["Chris O'Halloran"],
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -99,7 +98,11 @@ defmodule AlloyAgent.MixProject do
       main: "AlloyAgent",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "CHANGELOG.md"]
+      extras: ["README.md", "CHANGELOG.md"],
+      groups_for_modules: [
+        Runtime: [AlloyAgent, AlloyAgent.Server, AlloyAgent.Session],
+        "Memory stores": [AlloyAgent.Memory.InMemory, AlloyAgent.Memory.Disk]
+      ]
     ]
   end
 end
