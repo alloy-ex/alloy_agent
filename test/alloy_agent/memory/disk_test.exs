@@ -83,4 +83,64 @@ defmodule AlloyAgent.Memory.DiskTest do
     assert {:error, reason} = Disk.view(store, "/etc/passwd")
     assert reason =~ "must start with /memories"
   end
+
+  test "every operation returns the path error itself, not wrapped in another", %{store: store} do
+    expected = ~s(path must start with /memories: "/etc/passwd")
+
+    assert {:error, ^expected} = Disk.create(store, "/etc/passwd", "x")
+    assert {:error, ^expected} = Disk.str_replace(store, "/etc/passwd", "a", "b")
+    assert {:error, ^expected} = Disk.insert(store, "/etc/passwd", 0, "x")
+    assert {:error, ^expected} = Disk.delete(store, "/etc/passwd")
+    assert {:error, ^expected} = Disk.rename(store, "/etc/passwd", "/memories/x.md")
+    assert {:error, ^expected} = Disk.rename(store, "/memories/x.md", "/etc/passwd")
+  end
+
+  test "rejects paths that resolve outside the session root", %{store: store} do
+    assert {:error, reason} = Disk.view(store, "/memories/../../outside.md")
+    assert reason =~ "escapes session root"
+  end
+
+  test "missing paths report not found", %{store: store} do
+    assert {:error, "path not found: /memories/nope.md"} = Disk.view(store, "/memories/nope.md")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             Disk.str_replace(store, "/memories/nope.md", "a", "b")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             Disk.insert(store, "/memories/nope.md", 0, "x")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             Disk.rename(store, "/memories/nope.md", "/memories/new.md")
+  end
+
+  test "str_replace reports a missing old_str and leaves the file alone", %{store: store} do
+    Disk.create(store, "/memories/f.md", "hello")
+
+    assert {:error, "old_str not found in /memories/f.md"} =
+             Disk.str_replace(store, "/memories/f.md", "nope", "x")
+
+    assert {:ok, "hello"} = Disk.view(store, "/memories/f.md")
+  end
+
+  test "file operations on a directory report the filesystem error", %{store: store} do
+    Disk.create(store, "/memories/dir/a.md", "a")
+
+    assert {:error, "failed to read /memories/dir: " <> _} =
+             Disk.str_replace(store, "/memories/dir", "a", "b")
+
+    assert {:error, "failed to read /memories/dir: " <> _} =
+             Disk.insert(store, "/memories/dir", 0, "x")
+  end
+
+  test "a file standing where a directory is needed fails cleanly", %{store: store} do
+    Disk.create(store, "/memories/a.md", "a")
+
+    assert {:error, "failed to create /memories/a.md/b.md: " <> _} =
+             Disk.create(store, "/memories/a.md/b.md", "b")
+
+    Disk.create(store, "/memories/c.md", "c")
+
+    assert {:error, "failed to rename: " <> _} =
+             Disk.rename(store, "/memories/c.md", "/memories/a.md/c.md")
+  end
 end

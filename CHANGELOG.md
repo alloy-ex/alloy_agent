@@ -5,23 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-04-26
+## [0.1.0] - Unreleased
+
+The first release: the runtime that leaves `alloy` in 0.13, as a package of
+its own. It works with `alloy` 0.12.5 and 0.13.
 
 ### Added
 
-- Initial extraction from `alloy` 0.12.x runtime modules into a standalone package.
-- `AlloyAgent.Server` — supervised GenServer wrapping `Alloy.run/2` with session state.
-- `AlloyAgent.Session` — serializable session container.
-- Async dispatch: `send_message/3`, `cancel_request/2`, `max_pending` backpressure queue, PubSub broadcast on `"agent:<id>:responses"`.
-- Runtime policies: `fallback_providers`, `max_budget_cents` cost guard, `:session_start`/`:session_end` middleware hooks.
-- Default memory stores implementing `Alloy.Memory`:
-  - `AlloyAgent.Memory.InMemory` — Agent-backed, process-local.
-  - `AlloyAgent.Memory.Disk` — filesystem-backed, session-scoped.
+- `AlloyAgent.Server`, a supervised GenServer around Alloy's loop that holds
+  the conversation across calls: `chat/3`, `stream_chat/4`, `messages/1`,
+  `usage/1`, `reset/1`, `set_model/2`, `export_session/1`, `health/1`,
+  `stop/1` and `default_call_timeout/1`. The `AlloyAgent` module delegates to
+  it.
+- Async requests: `send_message/3` runs a request in a supervised task and
+  broadcasts `{:agent_response, result}` on `"agent:<session id>:responses"`;
+  `:max_pending` bounds the queue; `cancel_request/2` stops a running or queued
+  request. `:subscribe` runs `{:agent_event, message}` broadcasts.
+- `AlloyAgent.Session`, a plain, serializable conversation struct, and the
+  `:on_shutdown` callback that receives one.
+- `:session_start` and `:session_end` middleware hooks.
+- Memory stores implementing `Alloy.Memory`: `AlloyAgent.Memory.InMemory`
+  (process-local) and `AlloyAgent.Memory.Disk` (filesystem, one tree per
+  session id).
 
-### Not included (correction before first publish)
+### Changed from `Alloy.Agent.Server` (alloy 0.12.5)
 
-- **`AlloyAgent.Events` was removed before publishing.** The v1 event envelope module belongs in Alloy itself: `Alloy.Agent.Turn` (the protocol loop) calls it directly, so the envelope format is part of Alloy's protocol surface, not a runtime concern. Use [`Alloy.Events`](https://hexdocs.pm/alloy/Alloy.Events.html) from the `alloy` package instead — it is automatically available because `alloy_agent` depends on `alloy`. This correction shipped in `alloy 0.12.2`.
+The server started as a copy of alloy's, including its 0.12.5 fixes:
+`chat/3` and `stream_chat/4` wait as long as a turn may run, and results are
+tagged like `Alloy.run/2`. Where it now differs:
 
-### Requires
+- The server owns its runtime options (`:pubsub`, `:subscribe`,
+  `:max_pending`, `:on_shutdown`, `:messages`) and in-flight state, and
+  passes only loop options to `Alloy.Agent.Config.from_opts/1`. Middleware
+  can no longer change the PubSub settings, and `:sys.get_state/1` returns
+  `%AlloyAgent.Server{agent: %Alloy.Agent.State{}}`.
+- A run that fails before the model replies, including a crashed or
+  cancelled async request, no longer leaves its prompt in the history, so a
+  retry doesn't put two user messages in a row.
+- While an async request runs, `messages/1` and `export_session/1` return the
+  history from before it started.
+- Options are validated in `start_link/1`, which raises `ArgumentError` for
+  invalid ones, and `set_model/2` requires `:provider`.
+- `:on_shutdown` is typed as taking an `%AlloyAgent.Session{}`
+  ([alloy#40](https://github.com/alloy-ex/alloy/issues/40)).
+- Each run starts with `stop_reason: nil`, so a result never reports the
+  previous run's stop reason.
 
-- `{:alloy, "~> 0.12.2"}` — this release uses `Alloy.Events` (introduced in Alloy 0.12.2) and the `Alloy.Memory` behaviour (introduced in 0.12.0). `alloy_agent` will continue to be compatible with `alloy 0.13.x` once that release lands and removes the `Alloy.Agent.Server` / `Alloy.Session` / `Alloy.Agent.Events` deprecated shims.
+### Not included
+
+- `:max_budget_cents`. Alloy 0.13 removes it; enforce a budget with a
+  `:before_completion` middleware (the "Budget limits" recipe in the `Alloy`
+  module docs).
+- A PubSub started from application config. Put
+  `{Phoenix.PubSub, name: MyApp.PubSub}` in your supervision tree.
+- `AlloyAgent.Events`. Event envelopes are part of Alloy's protocol; use
+  `Alloy.Events`.

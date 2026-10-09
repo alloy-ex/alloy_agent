@@ -16,9 +16,40 @@ defmodule AlloyAgent.MixProject do
       docs: docs(),
       dialyzer: [
         plt_local_path: "priv/plts/project.plt",
-        plt_core_path: "priv/plts/core.plt"
+        plt_core_path: "priv/plts/core.plt",
+        # Third-party callers rely on our specs, so hold them to what the
+        # code actually returns.
+        flags: [:error_handling, :extra_return, :missing_return, :unmatched_returns]
       ],
+      test_coverage: [
+        # Ratchet: raise as coverage improves, never lower it.
+        summary: [threshold: 90],
+        ignore_modules: [~r/^AlloyAgent\.Test\./]
+      ],
+      aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env())
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [ci: :test]]
+  end
+
+  # `mix ci` runs every gate CI enforces, in the order that fails fastest.
+  # Docs build separately (`MIX_ENV=dev mix docs --warnings-as-errors`)
+  # because ex_doc is a dev-only dependency.
+  defp aliases do
+    [
+      ci: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "hex.audit",
+        "compile --warnings-as-errors --force",
+        "xref graph --format cycles --label compile-connected --fail-above 0",
+        "credo",
+        "test --warnings-as-errors --cover",
+        "dialyzer"
+      ]
     ]
   end
 
@@ -34,9 +65,7 @@ defmodule AlloyAgent.MixProject do
 
   defp deps do
     [
-      {:alloy, "~> 0.12.2"},
-      {:jason, "~> 1.2"},
-      {:telemetry, "~> 1.0"},
+      alloy_dep(),
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -44,10 +73,18 @@ defmodule AlloyAgent.MixProject do
     ]
   end
 
+  # ALLOY_PATH points at a sibling alloy checkout, for developing both
+  # packages together before an alloy release reaches Hex.
+  defp alloy_dep do
+    case System.get_env("ALLOY_PATH") do
+      nil -> {:alloy, "~> 0.12.5 or ~> 0.13.0"}
+      path -> {:alloy, path: path, override: true}
+    end
+  end
+
   defp package do
     [
       files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
-      maintainers: ["Chris O'Halloran"],
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -61,7 +98,11 @@ defmodule AlloyAgent.MixProject do
       main: "AlloyAgent",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "CHANGELOG.md"]
+      extras: ["README.md", "CHANGELOG.md"],
+      groups_for_modules: [
+        Runtime: [AlloyAgent, AlloyAgent.Server, AlloyAgent.Session],
+        "Memory stores": [AlloyAgent.Memory.InMemory, AlloyAgent.Memory.Disk]
+      ]
     ]
   end
 end

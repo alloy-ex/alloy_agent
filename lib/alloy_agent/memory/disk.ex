@@ -106,6 +106,8 @@ defmodule AlloyAgent.Memory.Disk do
          :ok <- File.write(fs, file_text) do
       {:ok, "created #{path}"}
     else
+      # to_fs_path/2 already returns a readable message.
+      {:error, message} when is_binary(message) -> {:error, message}
       {:error, reason} -> {:error, "failed to create #{path}: #{inspect(reason)}"}
     end
   end
@@ -116,6 +118,8 @@ defmodule AlloyAgent.Memory.Disk do
          {:ok, contents} <- File.read(fs) do
       apply_str_replace(fs, path, contents, old_str, new_str)
     else
+      # to_fs_path/2 already returns a readable message.
+      {:error, message} when is_binary(message) -> {:error, message}
       {:error, :enoent} -> {:error, "path not found: #{path}"}
       {:error, reason} -> {:error, "failed to read #{path}: #{inspect(reason)}"}
     end
@@ -147,6 +151,8 @@ defmodule AlloyAgent.Memory.Disk do
         {:error, reason} -> {:error, "failed to write #{path}: #{inspect(reason)}"}
       end
     else
+      # to_fs_path/2 already returns a readable message.
+      {:error, message} when is_binary(message) -> {:error, message}
       {:error, :enoent} -> {:error, "path not found: #{path}"}
       {:error, reason} -> {:error, "failed to read #{path}: #{inspect(reason)}"}
     end
@@ -170,6 +176,8 @@ defmodule AlloyAgent.Memory.Disk do
          :ok <- File.rename(old_fs, new_fs) do
       {:ok, "renamed #{old_path} -> #{new_path}"}
     else
+      # to_fs_path/2 already returns a readable message.
+      {:error, message} when is_binary(message) -> {:error, message}
       {:error, :enoent} -> {:error, "path not found: #{old_path}"}
       {:error, reason} -> {:error, "failed to rename: #{inspect(reason)}"}
     end

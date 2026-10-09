@@ -73,4 +73,19 @@ defmodule AlloyAgent.Memory.InMemoryTest do
     assert {:error, _} = InMemory.view(pid, "/memories/old.md")
     assert {:ok, "content"} = InMemory.view(pid, "/memories/new.md")
   end
+
+  test "operations on a missing path report not found and change nothing", %{store: pid} do
+    InMemory.create(pid, "/memories/keep.md", "keep")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             InMemory.str_replace(pid, "/memories/nope.md", "a", "b")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             InMemory.insert(pid, "/memories/nope.md", 0, "x")
+
+    assert {:error, "path not found: /memories/nope.md"} =
+             InMemory.rename(pid, "/memories/nope.md", "/memories/new.md")
+
+    assert InMemory.contents(pid) == %{"/memories/keep.md" => "keep"}
+  end
 end
