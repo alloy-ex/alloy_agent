@@ -49,6 +49,15 @@ defmodule AlloyAgent.Server do
   options or in `:session_start` middleware) fixes the id used for the
   PubSub topic and the exported session.
 
+  ## Failed runs
+
+  A run that fails before the model replies leaves the conversation as
+  it was: its user message is removed from the history, so it can simply
+  be sent again without two user messages in a row. This covers a
+  `{:error, result}` run whose prompt got no reply, an async request that
+  crashed, and a cancelled one. A failed run that got further keeps its
+  messages, so a follow-up can build on what it did.
+
   ## Supervision
 
       children = [
@@ -104,7 +113,7 @@ defmodule AlloyAgent.Server do
   @type result :: Result.t()
 
   @typedoc """
-  The summary `health/1` returns.
+  The summary `health/1` returns. `:status` is `:running` while a turn runs.
   """
   @type health :: %{
           status: State.status(),
@@ -117,7 +126,12 @@ defmodule AlloyAgent.Server do
           max_pending: non_neg_integer()
         }
 
-  @typep async_task :: %{ref: reference(), pid: pid(), request_id: String.t()}
+  @typep async_task :: %{
+           ref: reference(),
+           pid: pid(),
+           request_id: String.t(),
+           prompt: Message.t()
+         }
 
   @typep t :: %__MODULE__{
            agent: State.t(),
@@ -196,8 +210,9 @@ defmodule AlloyAgent.Server do
   @doc """
   Return the full conversation message history.
 
-  While an async request from `send_message/3` runs, this includes its
-  user message; the reply appears when it completes.
+  While an async request from `send_message/3` runs, this returns the
+  history from before it started; its user message and the reply appear
+  when it completes.
   """
   @spec messages(GenServer.server()) :: [Message.t()]
   def messages(server) do
@@ -320,7 +335,8 @@ defmodule AlloyAgent.Server do
   Cancel an async request by `request_id`.
 
   If the request is currently running, the active task is terminated.
-  If the request is queued, it is removed from the queue.
+  If the request is queued, it is removed from the queue. Either way the
+  request leaves no trace in the history.
 
   When cancelled, the server broadcasts an `{:agent_response, result}` payload
   with `status: :error`, `error: :cancelled`, the matching `:request_id`,
@@ -347,7 +363,7 @@ defmodule AlloyAgent.Server do
   Export the current conversation as a serializable Session struct.
 
   While an async request from `send_message/3` runs, the exported session
-  includes its user message but not the reply.
+  holds the history from before it started.
   """
   @spec export_session(GenServer.server()) :: Session.t()
   def export_session(server) do
@@ -542,7 +558,8 @@ defmodule AlloyAgent.Server do
     result = Result.from_state(final)
     broadcast_response(server.pubsub, final, %{result | request_id: task.request_id})
 
-    {:noreply, maybe_start_next_pending(%{server | agent: final, current_task: nil})}
+    agent = settle(final, task.prompt, Result.wrap(result))
+    {:noreply, maybe_start_next_pending(%{server | agent: agent, current_task: nil})}
   end
 
   # Task crashed — broadcast the error, free the agent so it can recover.
@@ -676,29 +693,48 @@ defmodule AlloyAgent.Server do
   end
 
   defp run_sync(%State{} = agent, message, turn_opts) do
-    final = agent |> begin_run(message) |> Turn.run_loop(turn_opts)
+    prompt = Message.user(message)
+    final = agent |> begin_run(prompt) |> Turn.run_loop(turn_opts)
+    reply = final |> Result.from_state() |> Result.wrap()
 
     # Keep messages but reset loop counters for the next call.
-    {final |> Result.from_state() |> Result.wrap(), reset_for_new_run(final)}
+    {reply, final |> settle(prompt, reply) |> reset_for_new_run()}
   end
 
-  defp begin_run(%State{} = agent, message) do
-    agent = agent |> State.append_messages([Message.user(message)]) |> reset_for_new_run()
+  defp begin_run(%State{} = agent, %Message{} = prompt) do
+    agent = agent |> State.append_messages([prompt]) |> reset_for_new_run()
     %{agent | status: :running}
   end
 
+  # A failed run whose prompt never got a reply would leave that prompt
+  # last in the history, and the next message would follow it as a second
+  # user message in a row, which providers that require alternation
+  # reject. Drop it so the message can be sent again as-is. A failed run
+  # that got further keeps its messages.
+  defp settle(%State{} = final, %Message{} = prompt, {:error, _result}) do
+    case Enum.split(State.messages(final), -1) do
+      {history, [^prompt]} -> %{final | messages: history}
+      _replied -> final
+    end
+  end
+
+  defp settle(%State{} = final, _prompt, {:ok, _result}), do: final
+
+  # The server keeps the state from before the async turn while its task
+  # runs, so a crashed or cancelled turn leaves the history untouched.
   @spec start_async_turn(t(), String.t(), String.t()) :: t()
   defp start_async_turn(%__MODULE__{agent: agent} = server, message, request_id)
        when is_binary(message) and is_binary(request_id) do
-    turn_state = begin_run(agent, message)
+    prompt = Message.user(message)
+    turn_state = begin_run(agent, prompt)
 
     task =
       Task.Supervisor.async_nolink(AlloyAgent.TaskSupervisor, fn ->
         Turn.run_loop(turn_state, event_correlation_id: request_id)
       end)
 
-    current_task = %{ref: task.ref, pid: task.pid, request_id: request_id}
-    %{server | agent: turn_state, current_task: current_task}
+    current_task = %{ref: task.ref, pid: task.pid, request_id: request_id, prompt: prompt}
+    %{server | current_task: current_task}
   end
 
   @spec fail_current_task(t(), term()) :: t()
@@ -775,7 +811,7 @@ defmodule AlloyAgent.Server do
 
   defp build_health(%__MODULE__{agent: agent} = server) do
     %{
-      status: agent.status,
+      status: health_status(server),
       turns: agent.turn,
       message_count: length(State.messages(agent)),
       usage: agent.usage,
@@ -785,6 +821,9 @@ defmodule AlloyAgent.Server do
       max_pending: server.max_pending
     }
   end
+
+  defp health_status(%__MODULE__{current_task: nil, agent: agent}), do: agent.status
+  defp health_status(%__MODULE__{}), do: :running
 
   # Returns the canonical "effective session ID" used consistently for both
   # PubSub broadcast topics and the exported Session.id.
