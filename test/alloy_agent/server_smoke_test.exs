@@ -48,6 +48,18 @@ defmodule AlloyAgent.ServerSmokeTest do
     assert :ok = AlloyAgent.stop(agent)
   end
 
+  test "stream_chat and set_model go through the facade" do
+    {:ok, first} = TestProvider.start_link([TestProvider.text_response("Streamed")])
+    {:ok, second} = TestProvider.start_link([TestProvider.text_response("Switched")])
+
+    {:ok, agent} = AlloyAgent.start_link(provider: {TestProvider, agent_pid: first})
+
+    assert {:ok, %{text: "Streamed"}} = AlloyAgent.stream_chat(agent, "Hi", fn _chunk -> :ok end)
+
+    assert :ok = AlloyAgent.set_model(agent, provider: {TestProvider, agent_pid: second})
+    assert {:ok, %{text: "Switched"}} = AlloyAgent.chat(agent, "Again")
+  end
+
   test "subsequent chat calls use the next scripted response" do
     {:ok, provider_pid} =
       TestProvider.start_link([

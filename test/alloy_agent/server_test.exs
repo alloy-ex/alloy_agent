@@ -316,6 +316,17 @@ defmodule AlloyAgent.ServerTest do
     end
   end
 
+  describe "unexpected messages" do
+    test "are ignored" do
+      {:ok, agent} = Server.start_link(opts(start_provider([TestProvider.text_response("Hi")])))
+
+      send(agent, :unexpected)
+      send(agent, {:agent_event, :not_a_binary})
+
+      assert {:ok, %{text: "Hi"}} = Server.chat(agent, "Hello")
+    end
+  end
+
   describe "graceful shutdown" do
     test "on_shutdown callback is called when agent stops" do
       test_pid = self()
