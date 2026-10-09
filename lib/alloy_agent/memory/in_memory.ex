@@ -28,7 +28,7 @@ defmodule AlloyAgent.Memory.InMemory do
   Start an empty in-memory store and return its pid. Pass the pid as
   the store term in `{AlloyAgent.Memory.InMemory, pid}`.
   """
-  @spec start_link() :: {:ok, pid()}
+  @spec start_link() :: Agent.on_start()
   def start_link, do: Agent.start_link(fn -> %{} end)
 
   @doc """

@@ -127,7 +127,7 @@ defmodule AlloyAgent.Server do
         }
 
   @typep async_task :: %{
-           ref: reference(),
+           ref: Task.ref(),
            pid: pid(),
            request_id: String.t(),
            prompt: Message.t()
@@ -625,6 +625,7 @@ defmodule AlloyAgent.Server do
   defp validate_runtime!(:on_shutdown, fun) when is_function(fun, 1), do: fun
   defp validate_runtime!(key, value), do: invalid_runtime!(key, value)
 
+  @spec invalid_runtime!(atom(), term()) :: no_return()
   defp invalid_runtime!(key, value) do
     raise ArgumentError,
           "#{inspect(key)} must be #{Map.fetch!(@runtime_expected, key)}, got: #{inspect(value)}"

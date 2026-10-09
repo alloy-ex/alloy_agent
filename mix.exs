@@ -16,9 +16,40 @@ defmodule AlloyAgent.MixProject do
       docs: docs(),
       dialyzer: [
         plt_local_path: "priv/plts/project.plt",
-        plt_core_path: "priv/plts/core.plt"
+        plt_core_path: "priv/plts/core.plt",
+        # Third-party callers rely on our specs, so hold them to what the
+        # code actually returns.
+        flags: [:error_handling, :extra_return, :missing_return, :unmatched_returns]
       ],
+      test_coverage: [
+        # Ratchet: raise as coverage improves, never lower it.
+        summary: [threshold: 90],
+        ignore_modules: [~r/^AlloyAgent\.Test\./]
+      ],
+      aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env())
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [ci: :test]]
+  end
+
+  # `mix ci` runs every gate CI enforces, in the order that fails fastest.
+  # Docs build separately (`MIX_ENV=dev mix docs --warnings-as-errors`)
+  # because ex_doc is a dev-only dependency.
+  defp aliases do
+    [
+      ci: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "hex.audit",
+        "compile --warnings-as-errors --force",
+        "xref graph --format cycles --label compile-connected --fail-above 0",
+        "credo",
+        "test --warnings-as-errors --cover",
+        "dialyzer"
+      ]
     ]
   end
 

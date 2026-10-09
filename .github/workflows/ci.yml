@@ -5,11 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
 
 env:
   MIX_ENV: test
-  ELIXIR_VERSION: "1.19"
-  OTP_VERSION: "27"
+  ELIXIR_VERSION: "1.20.4"
+  OTP_VERSION: "28.5.0.7"
 
 jobs:
   test:
@@ -19,11 +25,25 @@ jobs:
     strategy:
       matrix:
         include:
-          - elixir: "1.19"
+          - elixir: "1.20.4"
+            otp: "28.5.0.7"
+            lint: true
+            docs: true
+          - elixir: "1.19.6"
             otp: "27"
+            lint: true
+          - elixir: "1.20.4"
+            otp: "29"
+            lint: false
+          # Floor leg: mix.exs promises ~> 1.17, so compile + test it.
+          # Lint/format/dialyzer stay on the modern legs — formatter output
+          # and warning sets differ across Elixir versions.
+          - elixir: "1.17"
+            otp: "26"
+            lint: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: erlef/setup-beam@v1
         with:
@@ -31,7 +51,7 @@ jobs:
           otp-version: ${{ matrix.otp }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -40,15 +60,24 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - name: Cache PLT
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: priv/plts
           key: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - run: mix deps.get
-      - run: mix compile --warnings-as-errors
+
+      # Lint legs run every gate through the same alias contributors use
+      # locally (see `aliases/0` in mix.exs), so CI and `mix ci` can't drift.
+      - run: mix ci
+        if: ${{ matrix.lint }}
+
+      - run: mix compile
+        if: ${{ !matrix.lint }}
       - run: mix test
-      - run: mix format --check-formatted
-      - run: mix credo --strict
-      - run: mix dialyzer
+        if: ${{ !matrix.lint }}
+
+      - name: Docs build without warnings
+        if: ${{ matrix.docs }}
+        run: MIX_ENV=dev mix docs --warnings-as-errors
