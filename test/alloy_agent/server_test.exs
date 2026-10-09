@@ -565,66 +565,23 @@ defmodule AlloyAgent.ServerTest do
     end
   end
 
-  describe "init/1 PubSub subscription uses post-middleware config" do
-    defmodule SubscribeRewriteMiddleware do
-      @behaviour Alloy.Middleware
-
-      # Replaces the subscribe list with a middleware-chosen topic.
-      # If init reads the pre-middleware config, the agent will subscribe to
-      # "original_topic" (from opts). If it reads state.config (post-middleware),
-      # it subscribes to "middleware_topic". The test checks which one it got.
-      def call(:session_start, %Alloy.Agent.State{} = state) do
-        updated_config = %{state.config | subscribe: ["middleware_topic"]}
-        %{state | config: updated_config}
-      end
-
-      def call(_hook, %Alloy.Agent.State{} = state), do: state
-    end
-
+  describe ":subscribe" do
     setup do
       pubsub_name = :"test_pubsub_srv_#{System.unique_integer([:positive])}"
       start_supervised!({Phoenix.PubSub, name: pubsub_name})
       {:ok, pubsub: pubsub_name}
     end
 
-    test "subscribes to post-middleware topics, not pre-middleware opts topics", %{pubsub: pubsub} do
+    test "runs an {:agent_event, message} broadcast on a subscribed topic", %{pubsub: pubsub} do
       pid = start_provider([TestProvider.text_response("ok")])
 
-      # Agent opts say subscribe: ["original_topic"], but SubscribeRewriteMiddleware
-      # will rewrite state.config.subscribe to ["middleware_topic"] during :session_start.
-      # The bug: the old code reads `config.subscribe` (pre-middleware), so it
-      # subscribes to "original_topic" and ignores the middleware change.
-      # The fix: read `state.config.subscribe` (post-middleware).
-      {:ok, agent} =
-        Server.start_link(
-          opts(pid,
-            pubsub: pubsub,
-            subscribe: ["original_topic"],
-            middleware: [SubscribeRewriteMiddleware]
-          )
-        )
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, subscribe: ["tasks"]))
 
-      # If the bug is present, the agent subscribed to "original_topic" but stored
-      # "middleware_topic" in state.config. Verify the stored config is post-middleware.
-      agent_state = :sys.get_state(agent)
-      assert agent_state.config.subscribe == ["middleware_topic"]
+      Phoenix.PubSub.subscribe(pubsub, "agent:#{Server.export_session(agent).id}:responses")
+      Phoenix.PubSub.broadcast(pubsub, "tasks", {:agent_event, "hello from tasks"})
 
-      # More critically: verify the agent actually receives a message on the
-      # middleware topic, proving it subscribed to the right topic.
-      # Subscribe ourselves to observe the agent's response broadcast.
-      agent_id = agent_state.agent_id
-      Phoenix.PubSub.subscribe(pubsub, "agent:#{agent_id}:responses")
-
-      # Send to "middleware_topic" — only a subscribed agent will process this.
-      Phoenix.PubSub.broadcast(
-        pubsub,
-        "middleware_topic",
-        {:agent_event, "hello from middleware topic"}
-      )
-
-      # Agent must respond, confirming it was subscribed to "middleware_topic".
-      assert_receive {:agent_response, result}, 2000
-      assert result.status == :completed
+      assert_receive {:agent_response, %{status: :completed, text: "ok"}}, 2000
+      assert [%{content: "hello from tasks"}, %{role: :assistant}] = Server.messages(agent)
     end
   end
 
@@ -766,8 +723,9 @@ defmodule AlloyAgent.ServerTest do
 
       log = ExUnit.CaptureLog.capture_log(fn -> Server.stop(agent) end)
 
-      assert log =~ "on_shutdown callback threw"
-      assert log =~ "Stacktrace"
+      assert log =~ "on_shutdown callback failed"
+      assert log =~ "** (throw) :kaboom"
+      assert log =~ "server_test.exs"
     end
 
     test "logs the exception when on_shutdown raises" do
@@ -778,8 +736,8 @@ defmodule AlloyAgent.ServerTest do
 
       log = ExUnit.CaptureLog.capture_log(fn -> Server.stop(agent) end)
 
-      assert log =~ "on_shutdown callback raised"
-      assert log =~ "crash in shutdown"
+      assert log =~ "on_shutdown callback failed"
+      assert log =~ "** (RuntimeError) crash in shutdown"
     end
   end
 

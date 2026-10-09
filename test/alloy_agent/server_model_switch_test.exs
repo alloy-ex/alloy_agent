@@ -80,7 +80,7 @@ defmodule AlloyAgent.ServerModelSwitchTest do
       # functioning with its tools and system_prompt, then config was preserved.
 
       # For a more direct test, let's use :sys.get_state/1
-      state = :sys.get_state(agent)
+      %{agent: state} = :sys.get_state(agent)
       assert state.config.system_prompt == "You are helpful"
       assert state.config.max_turns == 10
       assert state.config.working_directory == "/tmp"
@@ -120,7 +120,7 @@ defmodule AlloyAgent.ServerModelSwitchTest do
       # Switch using just an atom (no config keyword list)
       :ok = Server.set_model(agent, provider: Alloy.Provider.Test)
 
-      state = :sys.get_state(agent)
+      %{agent: state} = :sys.get_state(agent)
       assert state.config.provider == Alloy.Provider.Test
       assert state.config.provider_config == %{}
     end
@@ -149,7 +149,7 @@ defmodule AlloyAgent.ServerModelSwitchTest do
           provider: {Alloy.Provider.OpenAI, [api_key: "sk-test", model: "gpt-5.4"]}
         )
 
-      assert :sys.get_state(agent).config.max_tokens == 922_000
+      assert :sys.get_state(agent).agent.config.max_tokens == 922_000
 
       assert :ok =
                Server.set_model(agent,
@@ -157,7 +157,7 @@ defmodule AlloyAgent.ServerModelSwitchTest do
                    {Alloy.Provider.Anthropic, [api_key: "sk-ant-test", model: "claude-haiku-4-5"]}
                )
 
-      assert :sys.get_state(agent).config.max_tokens == 200_000
+      assert :sys.get_state(agent).agent.config.max_tokens == 200_000
     end
 
     test "preserves explicit max_tokens on model switch" do
@@ -173,7 +173,7 @@ defmodule AlloyAgent.ServerModelSwitchTest do
                    {Alloy.Provider.Anthropic, [api_key: "sk-ant-test", model: "claude-haiku-4-5"]}
                )
 
-      assert :sys.get_state(agent).config.max_tokens == 123_456
+      assert :sys.get_state(agent).agent.config.max_tokens == 123_456
     end
   end
 end

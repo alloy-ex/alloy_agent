@@ -2,14 +2,14 @@ defmodule AlloyAgent.Server do
   @moduledoc """
   OTP-backed persistent agent process.
 
-  Wraps the stateless `Turn.run_loop/1` in a GenServer so the agent
-  can hold conversation history across multiple calls, be supervised,
-  and run concurrently with other agents.
+  Wraps Alloy's stateless loop (`Alloy.Agent.Turn.run_loop/2`) in a
+  GenServer so the agent can hold conversation history across multiple
+  calls, be supervised, and run concurrently with other agents.
 
   ## Usage
 
       {:ok, pid} = AlloyAgent.Server.start_link(
-        provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-opus-4-6"},
+        provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-5-5"},
         tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
         system_prompt: "You are a helpful assistant."
       )
@@ -22,16 +22,39 @@ defmodule AlloyAgent.Server do
 
   ## Options
 
-  All options from `Alloy.run/2` are accepted at start time, plus:
+  The server keeps these options for itself:
 
-  - `:name` - Register the process under a name (optional)
+  - `:name` - register the process under a name (see `GenServer.start_link/3`)
+  - `:messages` - conversation history to start from, such as the
+    `:messages` of an exported `AlloyAgent.Session` (default: `[]`)
+  - `:pubsub` - the name of a running `Phoenix.PubSub`. Required for
+    `send_message/3`; results are broadcast on `"agent:<session id>:responses"`
+    (default: `nil`)
+  - `:subscribe` - PubSub topics to subscribe to at start. A
+    `{:agent_event, message}` broadcast on one of them runs `message` as
+    an async request. Requires `:pubsub` (default: `[]`)
+  - `:max_pending` - how many `send_message/3` requests may queue while
+    one runs (default: `0`, which rejects them with `{:error, :busy}`)
+  - `:on_shutdown` - a 1-arity function called with the exported
+    `AlloyAgent.Session` when the agent stops (default: `nil`)
+
+  Every other option configures the loop and is passed to
+  `Alloy.Agent.Config.from_opts/1`, so it accepts the options
+  `Alloy.run/2` documents (`:provider`, `:tools`, `:system_prompt`,
+  `:middleware`, `:timeout_ms`, `:context`, ...). Invalid options raise
+  `ArgumentError` from `start_link/1`.
+
+  `:session_start` and `:session_end` middleware hooks run when the
+  agent starts and stops. Setting `:session_id` in `:context` (from the
+  options or in `:session_start` middleware) fixes the id used for the
+  PubSub topic and the exported session.
 
   ## Supervision
 
       children = [
         {AlloyAgent.Server, [
           name: :my_agent,
-          provider: {Alloy.Provider.Anthropic, api_key: System.get_env("ANTHROPIC_API_KEY"), model: "claude-opus-4-6"}
+          provider: {Alloy.Provider.Anthropic, api_key: System.get_env("ANTHROPIC_API_KEY"), model: "claude-sonnet-5-5"}
         ]}
       ]
       Supervisor.start_link(children, strategy: :one_for_one)
@@ -45,11 +68,21 @@ defmodule AlloyAgent.Server do
 
   require Logger
 
-  # :phoenix_pubsub is an optional dependency; calls are guarded at runtime
-  # by Code.ensure_loaded?/1, so a missing module must not warn at compile time.
+  # :phoenix_pubsub is an optional dependency; start_link/1 checks it is
+  # loaded before :pubsub can be used, so it must not warn at compile time.
   @compile {:no_warn_undefined, Phoenix.PubSub}
 
-  @type result :: Result.t()
+  # Options the server owns. Alloy's Config.from_opts/1 rejects keys it
+  # does not know, so these must never reach it.
+  @runtime_defaults [messages: [], pubsub: nil, subscribe: [], max_pending: 0, on_shutdown: nil]
+  @runtime_keys Keyword.keys(@runtime_defaults)
+  @runtime_expected %{
+    messages: "a list of Alloy.Message structs",
+    pubsub: "the name of a Phoenix.PubSub server",
+    subscribe: "a list of topic strings",
+    max_pending: "a non-negative integer",
+    on_shutdown: "a 1-arity function or nil"
+  }
 
   # A synchronous chat may still be finishing its last tool round or
   # building its result after the loop's provider deadline, so callers wait
@@ -57,15 +90,65 @@ defmodule AlloyAgent.Server do
   @call_timeout_margin_ms 10_000
   @default_call_timeout_ms struct(Config).timeout_ms + @call_timeout_margin_ms
 
+  @enforce_keys [:agent]
+  defstruct [
+    :agent,
+    pubsub: nil,
+    subscribe: [],
+    max_pending: 0,
+    on_shutdown: nil,
+    current_task: nil,
+    pending_requests: :queue.new()
+  ]
+
+  @type result :: Result.t()
+
+  @typedoc """
+  The summary `health/1` returns.
+  """
+  @type health :: %{
+          status: State.status(),
+          turns: non_neg_integer(),
+          message_count: non_neg_integer(),
+          usage: Usage.t(),
+          uptime_ms: integer(),
+          busy: boolean(),
+          pending_count: non_neg_integer(),
+          max_pending: non_neg_integer()
+        }
+
+  @typep async_task :: %{ref: reference(), pid: pid(), request_id: String.t()}
+
+  @typep t :: %__MODULE__{
+           agent: State.t(),
+           pubsub: atom() | nil,
+           subscribe: [String.t()],
+           max_pending: non_neg_integer(),
+           on_shutdown: (Session.t() -> term()) | nil,
+           current_task: async_task() | nil,
+           pending_requests: :queue.queue({String.t(), String.t()})
+         }
+
   # ── Client API ────────────────────────────────────────────────────────────
 
   @doc """
   Start a supervised, persistent agent process.
+
+  See the module docs for the options. Raises `ArgumentError` when an
+  option is invalid.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts) do
-    {name_opts, agent_opts} = Keyword.split(opts, [:name])
-    GenServer.start_link(__MODULE__, agent_opts, name_opts)
+  def start_link(opts) when is_list(opts) do
+    {gen_opts, opts} = Keyword.split(opts, [:name])
+    {runtime, agent_opts} = Keyword.split(opts, @runtime_keys)
+
+    runtime =
+      @runtime_defaults
+      |> Keyword.merge(runtime)
+      |> Map.new(fn {key, value} -> {key, validate_runtime!(key, value)} end)
+      |> validate_subscribe_needs_pubsub!()
+
+    GenServer.start_link(__MODULE__, {Config.from_opts(agent_opts), runtime}, gen_opts)
   end
 
   @doc """
@@ -76,7 +159,7 @@ defmodule AlloyAgent.Server do
 
   The result is tagged like `Alloy.run/2` (see `Alloy.Result.wrap/1`):
   `{:ok, result}` for `:completed` and `:max_turns`, `{:error, result}`
-  otherwise.
+  otherwise. Returns `{:error, :busy}` while an async request runs.
 
   The loop runs inside the server process, so every other call to this
   agent, including `health/1` and `cancel_request/2`, waits until it
@@ -89,7 +172,8 @@ defmodule AlloyAgent.Server do
       `default_call_timeout/1`). A caller that gives up earlier does not
       stop the run, which still commits its messages to the history.
   """
-  @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
+  @spec chat(GenServer.server(), String.t(), keyword()) ::
+          {:ok, result()} | {:error, result()} | {:error, :busy}
   def chat(server, message, opts \\ []) when is_binary(message) do
     timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
     GenServer.call(server, {:chat, message}, timeout)
@@ -112,9 +196,8 @@ defmodule AlloyAgent.Server do
   @doc """
   Return the full conversation message history.
 
-  Note: if an async Turn is in progress via `send_message/3`, this returns a
-  snapshot of the conversation *before* that Turn started. The in-flight
-  assistant response will appear only after the Turn completes.
+  While an async request from `send_message/3` runs, this includes its
+  user message; the reply appears when it completes.
   """
   @spec messages(GenServer.server()) :: [Message.t()]
   def messages(server) do
@@ -130,9 +213,10 @@ defmodule AlloyAgent.Server do
   end
 
   @doc """
-  Clear conversation history. Config and tools are preserved.
+  Clear conversation history. Config, tools and accumulated usage are
+  preserved.
 
-  Returns `{:error, :busy}` if an async Turn is currently running via `send_message/3`.
+  Returns `{:error, :busy}` while an async request from `send_message/3` runs.
   """
   @spec reset(GenServer.server()) :: :ok | {:error, :busy}
   def reset(server) do
@@ -142,20 +226,20 @@ defmodule AlloyAgent.Server do
   @doc """
   Switch the provider (and its config) mid-session.
 
-  Accepts `provider_opts` in the same format as the `:provider` option in
-  `start_link/1`.  Conversation history, tools, system prompt, and all
-  other config fields are preserved.
+  `provider_opts` must hold a `:provider`, in the same format as the
+  `:provider` option of `start_link/1`. Conversation history, tools,
+  system prompt, and all other config fields are preserved.
 
   ## Examples
 
       Server.set_model(pid, provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-4-5"})
       Server.set_model(pid, provider: Alloy.Provider.OpenAI)
 
-  Returns `{:error, :busy}` if an async Turn is currently running via `send_message/3`.
+  Returns `{:error, :busy}` while an async request from `send_message/3` runs.
   """
   @spec set_model(GenServer.server(), keyword()) :: :ok | {:error, :busy}
   def set_model(server, provider_opts) when is_list(provider_opts) do
-    GenServer.call(server, {:set_model, provider_opts})
+    GenServer.call(server, {:set_model, Keyword.fetch!(provider_opts, :provider)})
   end
 
   @doc """
@@ -166,9 +250,11 @@ defmodule AlloyAgent.Server do
 
     - `:timeout` - GenServer call timeout in milliseconds (default: the
       agent's `:timeout_ms` plus a margin, as for `chat/3`).
+    - `:on_event` - a 1-arity function called with each `Alloy.Events`
+      envelope of this run.
   """
-  @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
-          {:ok, result()} | {:error, result()}
+  @spec stream_chat(GenServer.server(), String.t(), (String.t() -> term()), keyword()) ::
+          {:ok, result()} | {:error, result()} | {:error, :busy}
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
     timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
@@ -189,7 +275,8 @@ defmodule AlloyAgent.Server do
   Returns `{:ok, request_id}` immediately. The agent runs its full Turn loop
   in a supervised Task, then broadcasts the result via PubSub to
   `"agent:<id>:responses"` as `{:agent_response, result}` where `result`
-  includes a `:request_id` field matching the returned ID.
+  includes a `:request_id` field matching the returned ID. `<id>` is the
+  `:id` of `export_session/1`.
 
   Backpressure behavior:
 
@@ -200,11 +287,6 @@ defmodule AlloyAgent.Server do
 
   Returns `{:error, :no_pubsub}` if the agent was started without a `:pubsub`
   option — without PubSub there is no way to receive results.
-
-  ## Requirements
-
-  PubSub must be configured on the agent. Add `pubsub: MyApp.PubSub` to the
-  agent start options.
 
   ## Options
 
@@ -218,6 +300,7 @@ defmodule AlloyAgent.Server do
         pubsub: MyApp.PubSub
       )
 
+      %{id: session_id} = AlloyAgent.Server.export_session(agent)
       Phoenix.PubSub.subscribe(MyApp.PubSub, "agent:\#{session_id}:responses")
 
       {:ok, req_id} = AlloyAgent.Server.send_message(agent, "Summarise the logs")
@@ -229,7 +312,7 @@ defmodule AlloyAgent.Server do
   @spec send_message(GenServer.server(), String.t(), keyword()) ::
           {:ok, binary()} | {:error, :busy | :queue_full | :no_pubsub}
   def send_message(server, message, opts \\ []) when is_binary(message) do
-    request_id = Keyword.get(opts, :request_id, generate_request_id())
+    request_id = Keyword.get_lazy(opts, :request_id, &generate_request_id/0)
     GenServer.call(server, {:send_message, message, request_id}, 30_000)
   end
 
@@ -240,7 +323,8 @@ defmodule AlloyAgent.Server do
   If the request is queued, it is removed from the queue.
 
   When cancelled, the server broadcasts an `{:agent_response, result}` payload
-  with `status: :error`, `error: :cancelled`, and the matching `:request_id`.
+  with `status: :error`, `error: :cancelled`, the matching `:request_id`,
+  and `cancelled_phase: :running | :queued`.
 
   Only `send_message/3` requests can be cancelled. A synchronous `chat/3`
   or `stream_chat/4` runs inside the server process, so this call waits
@@ -262,8 +346,8 @@ defmodule AlloyAgent.Server do
   @doc """
   Export the current conversation as a serializable Session struct.
 
-  Note: if an async Turn is in progress via `send_message/3`, the exported
-  session reflects the state *before* that Turn started (a pre-Turn snapshot).
+  While an async request from `send_message/3` runs, the exported session
+  includes its user message but not the reply.
   """
   @spec export_session(GenServer.server()) :: Session.t()
   def export_session(server) do
@@ -277,7 +361,7 @@ defmodule AlloyAgent.Server do
   behind a synchronous `chat/3` or `stream_chat/4`, which run inside the
   server process; it exits if that takes longer than 5 seconds.
   """
-  @spec health(GenServer.server()) :: map()
+  @spec health(GenServer.server()) :: health()
   def health(server) do
     GenServer.call(server, :health, 5_000)
   end
@@ -285,88 +369,38 @@ defmodule AlloyAgent.Server do
   # ── Server Callbacks ──────────────────────────────────────────────────────
 
   @impl GenServer
-  def init(opts) do
+  def init({%Config{} = config, runtime}) do
     Process.flag(:trap_exit, true)
-    config = Config.from_opts(opts)
-    state = State.init(config, Keyword.get(opts, :messages, []))
 
-    case Middleware.run(:session_start, state) do
+    case Middleware.run(:session_start, State.init(config, runtime.messages)) do
       {:halted, reason} ->
         {:stop, {:middleware_halted, reason}}
 
-      %State{} = state ->
-        # Subscribe to PubSub topics if configured.
-        # Use state.config (post-middleware) so session_start middleware can update
-        # pubsub/subscribe fields and have them reflected in actual subscriptions.
-        :ok = maybe_subscribe_pubsub(state)
-        {:ok, state}
+      %State{} = agent ->
+        server = struct!(__MODULE__, runtime |> Map.delete(:messages) |> Map.put(:agent, agent))
+        :ok = subscribe(server)
+        {:ok, server}
     end
   end
 
-  # Dialyzer flags state.config.on_shutdown.(session) at the call below because
-  # Alloy.Agent.Config types on_shutdown as (Alloy.Session.t() -> any()), but
-  # here we pass an %AlloyAgent.Session{}. Runtime contract is "any session-
-  # shaped struct"; the type fix in alloy is tracked at alloy-ex/alloy#40.
-  @dialyzer {:nowarn_function, terminate: 2}
   @impl GenServer
-  def terminate(_reason, state) do
+  def terminate(_reason, %__MODULE__{} = server) do
     # Kill any running async Turn task — prevents orphaned tasks after shutdown.
-    :ok = stop_current_task(state.current_task)
-
-    state =
-      case Middleware.run(:session_end, state) do
-        {:halted, reason} ->
-          Logger.warning(
-            "Alloy: :session_end middleware halted during shutdown (#{inspect(reason)})"
-          )
-
-          state
-
-        %State{} = new_state ->
-          new_state
-      end
-
-    if state.config.on_shutdown do
-      session = build_export_session(state)
-
-      try do
-        state.config.on_shutdown.(session)
-      rescue
-        e ->
-          Logger.warning(
-            "[Alloy] on_shutdown callback raised: #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}"
-          )
-      catch
-        kind, reason ->
-          Logger.warning(
-            "[Alloy] on_shutdown callback threw #{inspect(kind)}: #{inspect(reason)}\n" <>
-              "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
-          )
-      end
-    end
-
-    :ok
+    :ok = stop_current_task(server.current_task)
+    agent = run_session_end(server.agent)
+    run_on_shutdown(server.on_shutdown, agent)
   end
 
   # Reject synchronous chat while an async Turn is in flight — prevents state clobbering.
   @impl GenServer
-  def handle_call({:chat, _message}, _from, %{current_task: {_, _, _}} = state) do
-    {:reply, {:error, :busy}, state}
+  def handle_call({:chat, _message}, _from, %__MODULE__{current_task: %{}} = server) do
+    {:reply, {:error, :busy}, server}
   end
 
   @impl GenServer
-  def handle_call({:chat, message}, _from, state) do
-    # Append user message and run the full loop
-    state =
-      state
-      |> State.append_messages([Message.user(message)])
-      |> reset_for_new_run()
-      |> set_running()
-
-    final_state = Turn.run_loop(state)
-
-    # Keep messages but reset loop counters for next chat/2 call
-    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
+  def handle_call({:chat, message}, _from, %__MODULE__{} = server) do
+    {reply, agent} = run_sync(server.agent, message, [])
+    {:reply, reply, %{server | agent: agent}}
   end
 
   # Reject synchronous stream_chat while an async Turn is in flight.
@@ -374,107 +408,87 @@ defmodule AlloyAgent.Server do
   def handle_call(
         {:stream_chat, _message, _on_chunk, _stream_opts},
         _from,
-        %{current_task: {_, _, _}} = state
+        %__MODULE__{current_task: %{}} = server
       ) do
-    {:reply, {:error, :busy}, state}
+    {:reply, {:error, :busy}, server}
   end
 
   @impl GenServer
-  def handle_call({:stream_chat, message, on_chunk, stream_opts}, _from, state) do
-    state =
-      state
-      |> State.append_messages([Message.user(message)])
-      |> reset_for_new_run()
-      |> set_running()
-
+  def handle_call({:stream_chat, message, on_chunk, stream_opts}, _from, %__MODULE__{} = server) do
     turn_opts = Keyword.merge(stream_opts, streaming: true, on_chunk: on_chunk)
-    final_state = Turn.run_loop(state, turn_opts)
-
-    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
+    {reply, agent} = run_sync(server.agent, message, turn_opts)
+    {:reply, reply, %{server | agent: agent}}
   end
 
   @impl GenServer
-  def handle_call(:default_call_timeout, _from, state) do
-    {:reply, state.config.timeout_ms + @call_timeout_margin_ms, state}
+  def handle_call(:default_call_timeout, _from, %__MODULE__{agent: agent} = server) do
+    {:reply, agent.config.timeout_ms + @call_timeout_margin_ms, server}
   end
 
   @impl GenServer
-  def handle_call(:messages, _from, state) do
-    {:reply, State.messages(state), state}
+  def handle_call(:messages, _from, %__MODULE__{agent: agent} = server) do
+    {:reply, State.messages(agent), server}
   end
 
   @impl GenServer
-  def handle_call(:usage, _from, state) do
-    {:reply, state.usage, state}
+  def handle_call(:usage, _from, %__MODULE__{agent: agent} = server) do
+    {:reply, agent.usage, server}
   end
 
   # Reject reset while an async Turn is in flight — prevents state clobbering.
   @impl GenServer
-  def handle_call(:reset, _from, %{current_task: {_, _, _}} = state) do
-    {:reply, {:error, :busy}, state}
+  def handle_call(:reset, _from, %__MODULE__{current_task: %{}} = server) do
+    {:reply, {:error, :busy}, server}
   end
 
   @impl GenServer
-  def handle_call(:reset, _from, state) do
-    new_state =
-      %{state | messages: [], messages_new: [], pending_requests: :queue.new()}
-      |> reset_for_new_run()
-
-    {:reply, :ok, new_state}
+  def handle_call(:reset, _from, %__MODULE__{agent: agent} = server) do
+    {:reply, :ok, %{server | agent: reset_for_new_run(%{agent | messages: []})}}
   end
 
   # Reject set_model while an async Turn is in flight — prevents state clobbering.
   @impl GenServer
-  def handle_call({:set_model, _}, _from, %{current_task: {_, _, _}} = state) do
-    {:reply, {:error, :busy}, state}
+  def handle_call({:set_model, _provider}, _from, %__MODULE__{current_task: %{}} = server) do
+    {:reply, {:error, :busy}, server}
   end
 
   @impl GenServer
-  def handle_call({:set_model, provider_opts}, _from, state) do
-    updated_config = Config.with_provider(state.config, provider_opts[:provider])
-    {:reply, :ok, %{state | config: updated_config}}
+  def handle_call({:set_model, provider}, _from, %__MODULE__{agent: agent} = server) do
+    agent = %{agent | config: Config.with_provider(agent.config, provider)}
+    {:reply, :ok, %{server | agent: agent}}
   end
 
   @impl GenServer
-  def handle_call(:export_session, _from, state) do
-    {:reply, build_export_session(state), state}
+  def handle_call(:export_session, _from, %__MODULE__{agent: agent} = server) do
+    {:reply, build_export_session(agent), server}
   end
 
   @impl GenServer
-  def handle_call(:health, _from, state) do
-    {:reply,
-     %{
-       status: state.status,
-       turns: state.turn,
-       message_count: length(state.messages),
-       usage: state.usage,
-       uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0),
-       busy: state.current_task != nil,
-       pending_count: :queue.len(state.pending_requests),
-       max_pending: state.config.max_pending
-     }, state}
+  def handle_call(:health, _from, %__MODULE__{} = server) do
+    {:reply, build_health(server), server}
   end
 
   # Reject if PubSub is not configured — caller would wait forever for a broadcast.
   @impl GenServer
-  def handle_call({:send_message, _, _}, _from, %{config: %{pubsub: nil}} = state) do
-    {:reply, {:error, :no_pubsub}, state}
+  def handle_call({:send_message, _, _}, _from, %__MODULE__{pubsub: nil} = server) do
+    {:reply, {:error, :no_pubsub}, server}
   end
 
   @impl GenServer
-  def handle_call({:send_message, message, request_id}, _from, state) do
+  def handle_call({:send_message, message, request_id}, _from, %__MODULE__{} = server) do
     cond do
-      state.current_task == nil ->
-        {:reply, {:ok, request_id}, start_async_turn(state, message, request_id)}
+      server.current_task == nil ->
+        {:reply, {:ok, request_id}, start_async_turn(server, message, request_id)}
 
-      :queue.len(state.pending_requests) < state.config.max_pending ->
-        {:reply, {:ok, request_id}, enqueue_pending_request(state, message, request_id)}
+      :queue.len(server.pending_requests) < server.max_pending ->
+        pending = :queue.in({message, request_id}, server.pending_requests)
+        {:reply, {:ok, request_id}, %{server | pending_requests: pending}}
 
-      state.config.max_pending == 0 ->
-        {:reply, {:error, :busy}, state}
+      server.max_pending == 0 ->
+        {:reply, {:error, :busy}, server}
 
       true ->
-        {:reply, {:error, :queue_full}, state}
+        {:reply, {:error, :queue_full}, server}
     end
   end
 
@@ -482,175 +496,178 @@ defmodule AlloyAgent.Server do
   def handle_call(
         {:cancel_request, request_id},
         _from,
-        %{current_task: {ref, pid, request_id}} = state
-      )
-      when is_reference(ref) do
-    case Task.Supervisor.terminate_child(AlloyAgent.TaskSupervisor, pid) do
+        %__MODULE__{current_task: %{request_id: request_id} = task} = server
+      ) do
+    case Task.Supervisor.terminate_child(AlloyAgent.TaskSupervisor, task.pid) do
       :ok ->
-        Process.demonitor(ref, [:flush])
-        broadcast_cancelled(state, request_id, :running)
-
-        state =
-          state
-          |> Map.put(:current_task, nil)
-          |> Map.put(:status, :error)
-          |> Map.put(:error, :cancelled)
-          |> maybe_start_next_pending()
-
-        {:reply, :ok, state}
+        Process.demonitor(task.ref, [:flush])
+        server = fail_current_task(server, :cancelled)
+        broadcast_cancelled(server, request_id, :running)
+        {:reply, :ok, maybe_start_next_pending(server)}
 
       {:error, :not_found} ->
-        {:reply, {:error, :not_found}, state}
+        {:reply, {:error, :not_found}, server}
     end
   end
 
   @impl GenServer
-  def handle_call({:cancel_request, request_id}, _from, state) do
-    case remove_pending_request(state, request_id) do
-      {:ok, state} ->
-        broadcast_cancelled(state, request_id, :queued)
-        {:reply, :ok, state}
+  def handle_call({:cancel_request, request_id}, _from, %__MODULE__{} = server) do
+    case remove_pending_request(server, request_id) do
+      {:ok, server} ->
+        broadcast_cancelled(server, request_id, :queued)
+        {:reply, :ok, server}
 
       :not_found ->
-        {:reply, {:error, :not_found}, state}
+        {:reply, {:error, :not_found}, server}
     end
   end
 
   # Drop agent_event while an async Turn is in flight — prevents concurrent Turns.
   @impl GenServer
-  def handle_info({:agent_event, _message}, %{current_task: {_, _, _}} = state) do
-    Logger.warning("[Alloy] Dropping agent_event — async Turn already in progress")
-    {:noreply, state}
+  def handle_info({:agent_event, _message}, %__MODULE__{current_task: %{}} = server) do
+    Logger.warning("[AlloyAgent] Dropping agent_event — async Turn already in progress")
+    {:noreply, server}
   end
 
   @impl GenServer
-  def handle_info({:agent_event, message}, state) when is_binary(message) do
-    request_id = generate_request_id()
-    {:noreply, start_async_turn(state, message, request_id)}
+  def handle_info({:agent_event, message}, %__MODULE__{} = server) when is_binary(message) do
+    {:noreply, start_async_turn(server, message, generate_request_id())}
   end
 
-  # Task completed successfully — broadcast result and free the agent.
-  # Preserve final_state's actual status/turn/error — do NOT reset_for_new_run
-  # which would overwrite :completed with :running and zero the turn counter.
+  # Task completed — broadcast the result and keep the turn's final state,
+  # including its status and turn count, until the next run resets them.
   @impl GenServer
-  def handle_info({ref, final_state}, %{current_task: {ref, _pid, request_id}} = state)
-      when is_reference(ref) do
+  def handle_info({ref, %State{} = final}, %__MODULE__{current_task: %{ref: ref} = task} = server) do
     Process.demonitor(ref, [:flush])
+    result = Result.from_state(final)
+    broadcast_response(server.pubsub, final, %{result | request_id: task.request_id})
 
-    if final_state.config.pubsub do
-      topic = "agent:#{effective_session_id(final_state)}:responses"
-      result = %{build_result(final_state) | request_id: request_id}
-      broadcast(final_state.config.pubsub, topic, {:agent_response, result})
-    end
-
-    state =
-      final_state
-      |> Map.put(:current_task, nil)
-      # Preserve queue mutations performed while the async turn was running.
-      # The Task returns a snapshot taken at task start, which does not include
-      # requests enqueued by later send_message/3 calls.
-      |> Map.put(:pending_requests, state.pending_requests)
-      |> maybe_start_next_pending()
-
-    {:noreply, state}
+    {:noreply, maybe_start_next_pending(%{server | agent: final, current_task: nil})}
   end
 
   # Task crashed — broadcast the error, free the agent so it can recover.
   @impl GenServer
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
-        %{current_task: {ref, _, request_id}} = state
-      )
-      when is_reference(ref) do
+        %__MODULE__{current_task: %{ref: ref} = task} = server
+      ) do
     Logger.error(
-      "[Alloy] Async Turn crashed (request_id=#{inspect(request_id)}): #{inspect(reason)}"
+      "[AlloyAgent] Async Turn crashed (request_id=#{inspect(task.request_id)}): #{inspect(reason)}"
     )
 
-    if state.config.pubsub do
-      topic = "agent:#{effective_session_id(state)}:responses"
-
-      result =
-        state
-        |> build_result()
-        |> Map.merge(%{status: :error, error: reason, request_id: request_id})
-
-      broadcast(state.config.pubsub, topic, {:agent_response, result})
-    end
-
-    # NOTE: state here is the pre-Turn snapshot (including the user message that
-    # triggered the Turn). If the caller retries via send_message/3, that will
-    # append another user message, leaving two consecutive user messages in
-    # history. Anthropic enforces strict user/assistant alternation — callers
-    # should call reset/1 before retrying to clear the failed message.
-    state =
-      state
-      |> Map.put(:current_task, nil)
-      |> Map.put(:status, :error)
-      |> Map.put(:error, reason)
-      |> maybe_start_next_pending()
-
-    {:noreply, state}
+    server = fail_current_task(server, reason)
+    result = Result.from_state(server.agent)
+    broadcast_response(server.pubsub, server.agent, %{result | request_id: task.request_id})
+    {:noreply, maybe_start_next_pending(server)}
   end
 
   @impl GenServer
-  def handle_info({:EXIT, _pid, :normal}, state) do
+  def handle_info({:EXIT, _pid, :normal}, server) do
     # Normal exits from linked helpers (e.g., the process that called start_link)
     # are expected and should not stop the agent.
-    {:noreply, state}
+    {:noreply, server}
   end
 
   @impl GenServer
-  def handle_info({:EXIT, _pid, reason}, state) do
-    {:stop, reason, state}
+  def handle_info({:EXIT, _pid, reason}, server) do
+    {:stop, reason, server}
   end
 
   @impl GenServer
-  def handle_info(msg, state) do
-    Logger.debug("[Alloy] Unexpected message: #{inspect(msg)}")
-    {:noreply, state}
+  def handle_info(msg, server) do
+    Logger.debug("[AlloyAgent] Unexpected message: #{inspect(msg)}")
+    {:noreply, server}
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp broadcast(pubsub, topic, message) do
-    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("[Alloy] PubSub broadcast failed on #{inspect(topic)}: #{inspect(reason)}")
-    end
+  defp validate_runtime!(:messages, messages) when is_list(messages) do
+    if Enum.all?(messages, &is_struct(&1, Message)),
+      do: messages,
+      else: invalid_runtime!(:messages, messages)
   end
 
-  defp generate_request_id do
-    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
-  end
+  defp validate_runtime!(:pubsub, nil), do: nil
 
-  defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
-
-  defp maybe_subscribe_pubsub(%State{config: config}) do
-    unless Code.ensure_loaded?(Phoenix.PubSub) do
+  defp validate_runtime!(:pubsub, pubsub) when is_atom(pubsub) do
+    if Code.ensure_loaded?(Phoenix.PubSub) do
+      pubsub
+    else
       raise ArgumentError,
-            "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
+            ":pubsub is set but :phoenix_pubsub is not available. " <>
               "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
     end
+  end
 
-    Enum.each(config.subscribe, fn topic ->
-      case Phoenix.PubSub.subscribe(config.pubsub, topic) do
+  defp validate_runtime!(:subscribe, topics) when is_list(topics) do
+    if Enum.all?(topics, &is_binary/1), do: topics, else: invalid_runtime!(:subscribe, topics)
+  end
+
+  defp validate_runtime!(:max_pending, max) when is_integer(max) and max >= 0, do: max
+  defp validate_runtime!(:on_shutdown, nil), do: nil
+  defp validate_runtime!(:on_shutdown, fun) when is_function(fun, 1), do: fun
+  defp validate_runtime!(key, value), do: invalid_runtime!(key, value)
+
+  defp invalid_runtime!(key, value) do
+    raise ArgumentError,
+          "#{inspect(key)} must be #{Map.fetch!(@runtime_expected, key)}, got: #{inspect(value)}"
+  end
+
+  defp validate_subscribe_needs_pubsub!(%{subscribe: [_ | _], pubsub: nil}) do
+    raise ArgumentError, ":subscribe needs :pubsub, the PubSub to subscribe on"
+  end
+
+  defp validate_subscribe_needs_pubsub!(runtime), do: runtime
+
+  defp subscribe(%__MODULE__{pubsub: nil}), do: :ok
+
+  defp subscribe(%__MODULE__{pubsub: pubsub, subscribe: topics}) do
+    Enum.each(topics, fn topic ->
+      case Phoenix.PubSub.subscribe(pubsub, topic) do
         :ok ->
           :ok
 
         {:error, reason} ->
           Logger.warning(
-            "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
+            "[AlloyAgent] Failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
           )
       end
     end)
   end
 
+  defp run_session_end(%State{} = agent) do
+    case Middleware.run(:session_end, agent) do
+      {:halted, reason} ->
+        Logger.warning(
+          "[AlloyAgent] :session_end middleware halted during shutdown (#{inspect(reason)})"
+        )
+
+        agent
+
+      %State{} = agent ->
+        agent
+    end
+  end
+
+  defp run_on_shutdown(nil, _agent), do: :ok
+
+  # on_shutdown is the caller's code running inside terminate/2. Whatever
+  # it raises, throws or exits with, the agent must still finish stopping
+  # with its own reason, so the failure is logged rather than re-raised.
+  defp run_on_shutdown(on_shutdown, %State{} = agent) do
+    _ = on_shutdown.(build_export_session(agent))
+    :ok
+  catch
+    kind, reason ->
+      Logger.warning(
+        "[AlloyAgent] on_shutdown callback failed:\n" <>
+          Exception.format(kind, reason, __STACKTRACE__)
+      )
+  end
+
   defp stop_current_task(nil), do: :ok
 
-  defp stop_current_task({_ref, task_pid, _request_id}) do
+  defp stop_current_task(%{pid: task_pid}) do
     # terminate_child/2 may return {:error, :not_found} if the Task already
     # finished between the GenServer receiving :stop and terminate/2 running.
     # This is safe to ignore — the Task is gone either way.
@@ -658,60 +675,61 @@ defmodule AlloyAgent.Server do
     :ok
   end
 
-  defp set_running(state) do
-    %{state | status: :running}
+  defp run_sync(%State{} = agent, message, turn_opts) do
+    final = agent |> begin_run(message) |> Turn.run_loop(turn_opts)
+
+    # Keep messages but reset loop counters for the next call.
+    {final |> Result.from_state() |> Result.wrap(), reset_for_new_run(final)}
   end
 
-  defp start_async_turn(%State{} = state, message, request_id)
+  defp begin_run(%State{} = agent, message) do
+    agent = agent |> State.append_messages([Message.user(message)]) |> reset_for_new_run()
+    %{agent | status: :running}
+  end
+
+  @spec start_async_turn(t(), String.t(), String.t()) :: t()
+  defp start_async_turn(%__MODULE__{agent: agent} = server, message, request_id)
        when is_binary(message) and is_binary(request_id) do
-    turn_state =
-      state
-      |> State.append_messages([Message.user(message)])
-      |> reset_for_new_run()
-      |> set_running()
+    turn_state = begin_run(agent, message)
 
     task =
       Task.Supervisor.async_nolink(AlloyAgent.TaskSupervisor, fn ->
         Turn.run_loop(turn_state, event_correlation_id: request_id)
       end)
 
-    %{turn_state | current_task: {task.ref, task.pid, request_id}}
+    current_task = %{ref: task.ref, pid: task.pid, request_id: request_id}
+    %{server | agent: turn_state, current_task: current_task}
   end
 
-  defp enqueue_pending_request(%State{} = state, message, request_id)
-       when is_binary(message) and is_binary(request_id) do
-    %{state | pending_requests: :queue.in({message, request_id}, state.pending_requests)}
+  @spec fail_current_task(t(), term()) :: t()
+  defp fail_current_task(%__MODULE__{agent: agent} = server, reason) do
+    %{server | agent: %{agent | status: :error, error: reason}, current_task: nil}
   end
 
-  defp maybe_start_next_pending(%State{current_task: nil} = state) do
-    case :queue.out(state.pending_requests) do
+  @spec maybe_start_next_pending(t()) :: t()
+  defp maybe_start_next_pending(%__MODULE__{current_task: nil} = server) do
+    case :queue.out(server.pending_requests) do
       {:empty, _} ->
-        state
+        server
 
       {{:value, {message, request_id}}, rest} ->
-        state
-        |> Map.put(:pending_requests, rest)
-        |> start_async_turn(message, request_id)
+        start_async_turn(%{server | pending_requests: rest}, message, request_id)
     end
   end
 
-  defp remove_pending_request(%State{} = state, request_id) when is_binary(request_id) do
-    items = :queue.to_list(state.pending_requests)
+  defp remove_pending_request(%__MODULE__{} = server, request_id) when is_binary(request_id) do
+    items = :queue.to_list(server.pending_requests)
 
     case Enum.reject(items, fn {_msg, rid} -> rid == request_id end) do
       ^items -> :not_found
-      filtered -> {:ok, %{state | pending_requests: :queue.from_list(filtered)}}
+      filtered -> {:ok, %{server | pending_requests: :queue.from_list(filtered)}}
     end
   end
 
-  defp broadcast_cancelled(%State{config: %{pubsub: nil}}, _request_id, _phase), do: :ok
-
-  defp broadcast_cancelled(%State{} = state, request_id, phase) do
-    topic = "agent:#{effective_session_id(state)}:responses"
-
+  defp broadcast_cancelled(%__MODULE__{agent: agent, pubsub: pubsub}, request_id, phase) do
     result =
-      state
-      |> build_result()
+      agent
+      |> Result.from_state()
       |> Map.merge(%{
         status: :error,
         error: :cancelled,
@@ -719,35 +737,74 @@ defmodule AlloyAgent.Server do
         cancelled_phase: phase
       })
 
-    broadcast(state.config.pubsub, topic, {:agent_response, result})
+    broadcast_response(pubsub, agent, result)
   end
 
-  defp reset_for_new_run(state) do
-    %{state | turn: 0, status: :idle, error: nil, tool_calls: [], run_metadata: %{}}
+  # An {:agent_event, _} sent straight to the process runs without a PubSub.
+  defp broadcast_response(nil, _agent, _result), do: :ok
+
+  defp broadcast_response(pubsub, %State{} = agent, result) do
+    topic = "agent:#{effective_session_id(agent)}:responses"
+
+    case Phoenix.PubSub.broadcast(pubsub, topic, {:agent_response, result}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[AlloyAgent] PubSub broadcast failed on #{inspect(topic)}: #{inspect(reason)}"
+        )
+    end
   end
 
-  defp build_result(%State{} = state), do: Result.from_state(state)
+  defp generate_request_id do
+    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
+  end
+
+  defp reset_for_new_run(%State{} = agent) do
+    %{
+      agent
+      | turn: 0,
+        status: :idle,
+        error: nil,
+        stop_reason: nil,
+        tool_calls: [],
+        run_metadata: %{}
+    }
+  end
+
+  defp build_health(%__MODULE__{agent: agent} = server) do
+    %{
+      status: agent.status,
+      turns: agent.turn,
+      message_count: length(State.messages(agent)),
+      usage: agent.usage,
+      uptime_ms: System.monotonic_time(:millisecond) - (agent.started_at || 0),
+      busy: server.current_task != nil,
+      pending_count: :queue.len(server.pending_requests),
+      max_pending: server.max_pending
+    }
+  end
 
   # Returns the canonical "effective session ID" used consistently for both
   # PubSub broadcast topics and the exported Session.id.
   #
-  # Precedence: context[:session_id] (set by middleware) > state.agent_id (stable UUID).
-  # Using this helper in both handle_info({:agent_event, ...}) and
-  # build_export_session/1 guarantees that subscribers using the exported
-  # session ID always receive events on the correct topic.
-  defp effective_session_id(%State{} = state) do
-    Map.get(state.config.context, :session_id) || state.agent_id
+  # Precedence: context[:session_id] (set by middleware) > agent_id (stable UUID).
+  # Using it for both guarantees that subscribers using the exported
+  # session ID always receive results on the correct topic.
+  defp effective_session_id(%State{} = agent) do
+    Map.get(agent.config.context, :session_id) || agent.agent_id
   end
 
-  defp build_export_session(%State{} = state) do
+  defp build_export_session(%State{} = agent) do
     Session.new(
-      id: effective_session_id(state),
-      messages: State.messages(state),
-      usage: state.usage,
+      id: effective_session_id(agent),
+      messages: State.messages(agent),
+      usage: agent.usage,
       metadata: %{
-        status: state.status,
-        turns: state.turn,
-        provider: state.config.provider
+        status: agent.status,
+        turns: agent.turn,
+        provider: agent.config.provider
       }
     )
   end
