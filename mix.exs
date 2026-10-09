@@ -34,14 +34,21 @@ defmodule AlloyAgent.MixProject do
 
   defp deps do
     [
-      {:alloy, "~> 0.12.2"},
-      {:jason, "~> 1.2"},
-      {:telemetry, "~> 1.0"},
+      alloy_dep(),
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
+  end
+
+  # ALLOY_PATH points at a sibling alloy checkout, for developing both
+  # packages together before an alloy release reaches Hex.
+  defp alloy_dep do
+    case System.get_env("ALLOY_PATH") do
+      nil -> {:alloy, "~> 0.12.5 or ~> 0.13.0"}
+      path -> {:alloy, path: path, override: true}
+    end
   end
 
   defp package do
